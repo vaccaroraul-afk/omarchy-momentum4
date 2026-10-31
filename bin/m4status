@@ -10,8 +10,15 @@ that only a Momentum 4 is ever spoken to.
 
 Exits 0 with an empty object when nothing is connected — the widget hides
 itself rather than showing a stale value.
+
+    m4status [--mac AA:BB:CC:DD:EE:FF --name "MOMENTUM 4"]
+
+The widget passes the address and name it already has from BlueZ, which
+skips the bluetoothctl lookups here and in m4ctl. Without them (from a
+terminal) the connected device is looked up as before.
 """
 
+import argparse
 import json
 import os
 import re
@@ -240,8 +247,16 @@ def run(cmd, timeout=TIMEOUT, limit=MAX_OUTPUT):
                 pass
         return None
 
+MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+
 def connected_device():
-    """(mac, name) of the first connected device that looks like audio."""
+    """(mac, name) of the first connected, supported audio device.
+
+    Only names a backend handles are considered: upstream returned any audio
+    device, so another speaker or headset made the widget appear with no
+    battery, and could be picked ahead of the Momentum.
+    """
     out = run(["bluetoothctl", "devices", "Connected"], timeout=5)
     if not out:
         return None, None
@@ -250,6 +265,8 @@ def connected_device():
         if len(parts) < 3:
             continue
         mac, name = parts[1], parts[2]
+        if not backend_for(name):
+            continue
         info = run(["bluetoothctl", "info", mac], timeout=5) or ""
         # Audio Sink UUID, or an audio icon — avoids matching mice and keyboards.
         if "0000110b" in info or "audio-" in info:
@@ -315,7 +332,15 @@ def backend_for(name):
 
 def main():
     install_teardown()
-    mac, name = connected_device()
+    ap = argparse.ArgumentParser(prog="m4status")
+    ap.add_argument("--mac", help="device address, skips the bluetoothctl lookup")
+    ap.add_argument("--name", help="device name, used with --mac")
+    args = ap.parse_args()
+
+    if args.mac and MAC_RE.match(args.mac) and backend_for(args.name):
+        mac, name = args.mac.upper(), args.name
+    else:
+        mac, name = connected_device()
     if not mac:
         print("{}")
         return
@@ -328,7 +353,8 @@ def main():
 
     backend = backend_for(name)
     if backend:
-        out = run([backend, "get", "--json"])
+        # --mac: m4ctl would otherwise ask bluetoothctl for it a second time.
+        out = run([backend, "get", "--json", "--mac", mac])
         if out:
             try:
                 d = json.loads(out)

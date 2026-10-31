@@ -1,6 +1,9 @@
 import QtQuick
+// Qualified so nothing in Controls (Button, above all) can shadow qs.Ui's.
+import QtQuick.Controls as QQC
 import Quickshell
 import Quickshell.Io
+import Quickshell.Bluetooth
 import qs.Commons
 import qs.Ui
 
@@ -11,11 +14,18 @@ import qs.Ui
 // Ui/Panel for the open/close controller and keyboard handling; IPC is left
 // to the bar widget so the target is registered once.
 //
-// Everything, battery included, speaks GAIA over RFCOMM via bin/m4ctl. No
-// BlueZ extras and no root are involved.
+// Two sources, and nothing on a fixed timer:
 //
-// State is polled rather than subscribed: reading the device means opening
-// an RFCOMM socket, and holding that open would lock out other clients.
+// - Presence and the bar's battery come from BlueZ through Quickshell's
+//   Bluetooth module, which the shell already holds a D-Bus connection for.
+//   Those are change notifications, so with the headphones away, or with them
+//   connected and the panel closed, this plugin starts no processes at all.
+// - Everything else (noise control, EQ, settings, the exact battery) speaks
+//   GAIA over RFCOMM via bin/m4status -> bin/m4ctl, and is read only when it
+//   can matter: once when the headphones connect, while the panel is open,
+//   after each change made from here, and on middle-click. Reading means
+//   opening an RFCOMM socket, and holding it open would lock out other
+//   clients, so it is never kept open between reads.
 Panel {
   id: root
   moduleName: "dansmith888.momentum4"
@@ -34,8 +44,37 @@ Panel {
     return false
   }
 
-  property int percentage: -1
-  property string deviceName: ""
+  // ---- Presence and battery, from BlueZ (event-driven) ----
+  //
+  // Matched by name, so another Bluetooth speaker or headset never brings
+  // the pill up. The binding re-evaluates when the device list changes or a
+  // device's connected/name properties do, which is what replaces polling.
+  readonly property var btDevice: {
+    var list = Bluetooth.devices ? Bluetooth.devices.values : []
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i]
+      if (d && d.connected && /MOMENTUM\s*4/i.test(d.name || d.deviceName || "")) return d
+    }
+    return null
+  }
+  readonly property bool devicePresent: btDevice !== null
+  readonly property string deviceName: btDevice ? (btDevice.name || btDevice.deviceName || "") : ""
+  readonly property string deviceMac: btDevice ? String(btDevice.address) : ""
+
+  // BlueZ learns the battery from the headset's hands-free link and may round
+  // it; GAIA reports the exact figure. Whichever was read last wins, so the
+  // panel shows GAIA's number and the bar keeps following BlueZ afterwards.
+  readonly property int bluezPercentage: btDevice && btDevice.batteryAvailable
+      ? Math.round(btDevice.battery * 100) : -1
+  readonly property bool bluezBatteryAvailable: btDevice ? btDevice.batteryAvailable === true : false
+  property int gaiaPercentage: -1
+  property real gaiaAt: 0             // ms of the last GAIA battery reading
+  property real bluezAt: 0            // ms of the last BlueZ battery change
+  readonly property int percentage: (root.gaiaPercentage >= 0 && root.gaiaAt >= root.bluezAt)
+      ? root.gaiaPercentage : root.bluezPercentage
+
+  onBluezPercentageChanged: root.bluezAt = Date.now()
+
   property bool ancSupported: false
   property bool ancOn: false
   property string mode: ""            // "adaptive" | "custom" | "off"
@@ -60,7 +99,6 @@ Panel {
       : root.codec + (root.sampleRate > 0
           ? " · " + (root.sampleRate / 1000).toFixed(1).replace(/\.0$/, "") + " kHz" : "")
   property bool charging: false       // USB cable attached
-  property bool devicePresent: false  // any supported headset connected
   property bool busy: false
   property bool stale: false          // last poll failed; readings are old
 
@@ -133,7 +171,7 @@ Panel {
   property var procTermedAt: ({})    // key -> ms when we asked it to stop
 
   function watchedProcs() {
-    return { statusProc: statusProc, presetProc: presetProc, actionProc: actionProc }
+    return { statusProc: statusProc, actionProc: actionProc }
   }
 
   function noteStarted(key, isRunning) {
@@ -163,10 +201,11 @@ Panel {
     }
   }
 
+  // Ticks only while a helper is running; idle, nothing wakes up.
   Timer {
     interval: 1000
     repeat: true
-    running: true
+    running: statusProc.running || actionProc.running
     onTriggered: {
       var now = Date.now()
       var procs = root.watchedProcs()
@@ -194,16 +233,75 @@ Panel {
   // that started it, so it is killed outright rather than asked.
   Component.onDestruction: root.reapAll()
 
+  // A GAIA read is only worth starting while BlueZ says the headphones are
+  // here: an RFCOMM connect to an absent device just sits in its timeouts.
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (root.devicePresent && !statusProc.running) statusProc.running = true
   }
+
+  // BlueZ already told us the address, so the helpers need not ask
+  // bluetoothctl for it again on every run.
+  readonly property var macArgs: /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/.test(root.deviceMac)
+      ? ["--mac", root.deviceMac] : []
 
   function apply(args) {
     if (!root.ancSupported || root.busy) return
     root.busy = true
-    actionProc.command = [root.pluginDir + "bin/m4ctl"].concat(args)
+    actionProc.command = [root.pluginDir + "bin/m4ctl"].concat(args).concat(root.macArgs)
     actionProc.running = true
   }
+
+  // ---- When to read over GAIA ----
+  //
+  // Once shortly after the headphones connect (the RFCOMM service is not
+  // always ready the instant BlueZ reports the link), retried a few times if
+  // the first attempt does not get through. The panel-open timer further
+  // down covers the rest.
+  property int connectRetries: 0
+  readonly property int maxConnectRetries: 3
+
+  function scheduleRetry() {
+    if (!root.devicePresent || root.connectRetries >= root.maxConnectRetries) return
+    root.connectRetries++
+    connectRead.restart()
+  }
+
+  function resetDeviceState() {
+    root.gaiaPercentage = -1
+    root.gaiaAt = 0
+    root.ancSupported = false
+    root.stale = false
+    root.charging = false
+    root.codec = ""
+    root.sampleRate = 0
+  }
+
+  Timer {
+    id: connectRead
+    interval: 3000
+    repeat: false
+    onTriggered: root.refresh()
+  }
+
+  onDevicePresentChanged: {
+    if (root.devicePresent) {
+      root.connectRetries = 0
+      connectRead.restart()
+    } else {
+      connectRead.stop()
+      root.resetDeviceState()
+      if (root.opened) root.close()
+    }
+  }
+
+  // BlueZ's battery appearing or vanishing usually means the USB-C cable went
+  // in or out (the headphones stop reporting battery while it is attached).
+  // One read is enough for the charging glyph to follow.
+  onBluezBatteryAvailableChanged: if (root.devicePresent) connectRead.restart()
+
+  // The shell may start with the headphones already connected; in that case
+  // there is no change to react to, so read once now.
+  Component.onCompleted: if (root.devicePresent) connectRead.restart()
 
   // Axis runs ANC (left) to Transparency (right), matching the Sennheiser
   // iOS app. That ordering happens to match the hardware exactly, raw 0 is
@@ -294,37 +392,51 @@ Panel {
   Process {
     id: statusProc
     onRunningChanged: root.noteStarted("statusProc", running)
-    command: [root.pluginDir + "bin/m4status"]
+    // Address and name come from BlueZ, so m4status skips its own
+    // bluetoothctl discovery and goes straight to the headphones.
+    command: [root.pluginDir + "bin/m4status"].concat(root.macArgs)
+        .concat(root.deviceName !== "" ? ["--name", root.deviceName] : [])
     stdout: SplitParser {
       splitMarker: "\n"
       onRead: function (line) { root.takeLine("statusProc", line) }
     }
     onExited: {
+        // Disconnected while the read was in flight: BlueZ already hid the
+        // pill and reset the state, so there is nothing to apply.
+        if (!root.devicePresent) return
         var out = root.lineFor("statusProc")
-        // Empty output means the read failed or was cancelled, not that the
-        // headphones went away: keep the last reading and mark it stale
-        // rather than pulling the pill out of the bar. A real "{}" from the
-        // probe is the disconnect case and still hides it.
-        if (out === "") { root.stale = root.devicePresent; return }
-        if (out === "{}") { root.percentage = -1; root.devicePresent = false; return }
+        // Empty output means the read failed or was cancelled; "{}" means
+        // m4status could not find the device. Presence is BlueZ's call now,
+        // so neither hides the pill: keep the last reading, mark it stale,
+        // and try again if this was the read after connecting.
+        if (out === "" || out === "{}") {
+          root.stale = true
+          root.scheduleRetry()
+          return
+        }
         try {
           var d = JSON.parse(out)
-          root.devicePresent = !!d.mac
           // The device is connected but m4ctl could not reach it, another
           // client (the phone app, a research tool) holds the RFCOMM
           // channel, or the lock timed out. That is transient: keep the
           // last good readings rather than blanking the pill and greying
           // every control, which reads as "the plugin died".
-          if (d.mac && d.battery === null && d.anc_supported !== true && root.ancSupported) {
+          var gaiaFailed = typeof d.battery !== "number" && d.anc_supported !== true
+          if (gaiaFailed) root.scheduleRetry()
+          else root.connectRetries = 0
+          if (gaiaFailed && root.ancSupported) {
             root.stale = true
             return
           }
           root.stale = false
           root.codec        = d.codec || ""
           root.sampleRate   = (typeof d.sample_rate === "number") ? d.sample_rate : 0
-          root.charging     = d.charging === true
-          root.percentage   = (typeof d.battery === "number") ? d.battery : -1
-          root.deviceName   = d.name || ""
+          // m4status calls it usb_connected (plugged into this PC, not
+          // necessarily charging); upstream still read the old "charging"
+          // key here, so the glyph never showed.
+          root.charging     = d.usb_connected === true
+          root.gaiaPercentage = (typeof d.battery === "number") ? d.battery : -1
+          if (root.gaiaPercentage >= 0) root.gaiaAt = Date.now()
           root.ancSupported = d.anc_supported === true
           root.ancOn        = d.anc === true
           if (typeof d.transparency === "number") root.transparency = d.transparency
@@ -340,32 +452,30 @@ Panel {
           root.onHead      = (typeof d.on_head      === "boolean") ? d.on_head      : null
           root.autoOff     = (typeof d.auto_off     === "number")  ? d.auto_off     : null
         } catch (e) {
-          root.percentage = -1
-          root.devicePresent = false
+          // Unparseable output is a failed read, not a disconnect.
+          root.stale = root.ancSupported
+          root.scheduleRetry()
         }
     }
   }
 
-  // Preset definitions are static local data, so one load is normally enough.
-  // It is retried when the headphones arrive because the shell usually starts
-  // before they connect, and an early failure would otherwise leave the panel
-  // with no presets for the rest of the session.
-  onDevicePresentChanged: if (root.devicePresent && root.presets.length === 0
-                              && !presetProc.running) presetProc.running = true
-
-  Process {
-    id: presetProc
-    onRunningChanged: root.noteStarted("presetProc", running)
-    command: [root.pluginDir + "bin/m4ctl", "presets", "--json"]
-    running: true
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function (line) { root.takeLine("presetProc", line) }
+  // Preset definitions are static local data, read straight from the file
+  // the shell already has access to. Upstream started a Python process
+  // (m4ctl presets --json) at every shell start for this; m4ctl prints the
+  // same "presets" array, so the parse is unchanged.
+  FileView {
+    id: presetFile
+    path: root.pluginDir + "presets.json"
+    printErrors: false
+    onLoaded: {
+      try {
+        var p = JSON.parse(presetFile.text()).presets
+        root.presets = Array.isArray(p) ? p : []
+      } catch (e) {
+        root.presets = []
+      }
     }
-    onExited: {
-      try { root.presets = JSON.parse(root.lineFor("presetProc")) || [] }
-      catch (e) { root.presets = [] }
-    }
+    onLoadFailed: root.presets = []
   }
 
   Process {
@@ -374,21 +484,10 @@ Panel {
     onExited: { root.busy = false; root.refresh() }
   }
 
-  // Poll quickly while nothing is connected and slowly once something is.
-  // A flat 60s meant the widget could take a full minute to appear after the
-  // headphones woke and paired, which reads as "it isn't working".
-  Timer {
-    interval: root.devicePresent ? 60000 : 5000
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
-  }
-
-  // Poll faster while the popup is open so the readout tracks the device.
-  // triggeredOnStart matters: without it the panel shows up to a minute of
-  // stale state for the first five seconds after opening, which reads as a
-  // bug when the setting was just changed in the phone app.
+  // Read every 5s while the popup is open so the readout tracks the device;
+  // with it closed nothing is read on a timer. triggeredOnStart matters: it
+  // is what shows a setting just changed in the phone app the moment the
+  // panel opens.
   Timer {
     interval: 5000
     running: root.opened
@@ -397,6 +496,13 @@ Panel {
     onTriggered: if (!root.busy) root.refresh()
   }
 
+  // Two columns side by side where the screen has the width, which keeps the
+  // panel well inside a short screen's height; stacked where it does not.
+  readonly property int columnWidth: Style.space(300)
+  readonly property int columnGap: Style.space(24)
+  readonly property bool twoColumns: panel.availableCardWidth <= 0
+      || panel.availableCardWidth >= root.columnWidth * 2 + root.columnGap
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -404,7 +510,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(300))
+    contentWidth: panel.fittedContentWidth(root.twoColumns
+        ? root.columnWidth * 2 + root.columnGap : root.columnWidth)
     contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(900))
 
     PanelKeyCatcher {
@@ -416,314 +523,496 @@ Panel {
         if (dx !== 0) root.setUiLevel(root.uiLevel + dx * 10)
       }
 
-      Column {
-        id: panelColumn
-        // anchors.fill, no margins of our own: KeyboardPanel already pads the
-        // surface, and adding panelPadding on top of it was what made this
-        // panel sit inside a much fatter border than the built-in ones.
+      // KeyboardPanel caps the card at the screen's free height, but the
+      // column kept its full height and the bottom rows were cut off on
+      // short screens (1080p at 1.25 scale leaves ~800 logical px). Scroll
+      // instead, the way the shell's own Audio panel does; when everything
+      // fits, this is inert.
+      QQC.ScrollView {
+        id: scrollArea
         anchors.fill: parent
-        spacing: Style.spacing.sm
-        // While the device is connected but not answering (another client
-        // holds the channel), the readings are last-known and a write would
-        // only queue behind the lock and fail, so nothing is clickable.
-        enabled: !root.stale
-        opacity: root.stale ? 0.55 : 1.0
+        clip: true
+        QQC.ScrollBar.horizontal.policy: QQC.ScrollBar.AlwaysOff
+        QQC.ScrollBar.vertical.policy: panelColumn.implicitHeight > height
+            ? QQC.ScrollBar.AsNeeded : QQC.ScrollBar.AlwaysOff
+        Binding {
+          target: scrollArea.contentItem
+          property: "interactive"
+          value: panelColumn.implicitHeight > scrollArea.height
+        }
+        // Wheel, touchpad and the scroll bar scroll; a mouse drag never
+        // flicks. The EQ bands are vertical sliders without preventStealing,
+        // so a flickable that took mouse drags would scroll the panel
+        // mid-drag and cancel the band before its value was written.
+        Binding {
+          target: scrollArea.contentItem
+          property: "acceptedButtons"
+          value: Qt.NoButton
+        }
 
-        // The shell's standard panel header: glyph left, title, status badge
-        // right, the shape the built-in panels and other plugins use.
-        PanelHero {
-          width: parent.width
-          title: root.displayName
-          // Kept short: the badge eats the right-hand side, and a longer
-          // string elides mid-codec.
-          meta: (root.present ? root.percentage + "%" + (root.charging ? " · charging" : "")
-              : root.charging ? "Charging"
-              : "Battery unknown")
-              + (root.streamText !== "" ? " · " + root.streamText : "")
-          // No "connected" badge: the widget hides itself when the headphones
-          // are away, so it would only ever say one thing. BUSY is worth a
-          // badge because the panel otherwise looks connected but inert.
-          detail: root.stale ? "BUSY" : ""
-          foreground: Color.popups.text
-          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-          iconOpacity: root.stale ? 0.5 : 1
-          iconComponent: Component {
-            Text {
-              textFormat: Text.PlainText
-              text: "󰋋"
-              color: Color.popups.text
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.display
+        Column {
+          id: panelColumn
+          // No margins of our own: KeyboardPanel already pads the surface, and
+          // adding panelPadding on top of it was what made this panel sit
+          // inside a much fatter border than the built-in ones.
+          width: scrollArea.availableWidth
+          spacing: Style.spacing.sm
+          // While the device is connected but not answering (another client
+          // holds the channel), the readings are last-known and a write would
+          // only queue behind the lock and fail, so nothing is clickable.
+          enabled: !root.stale
+          opacity: root.stale ? 0.55 : 1.0
+
+          // The shell's standard panel header: glyph left, title, status badge
+          // right, the shape the built-in panels and other plugins use.
+          PanelHero {
+            width: parent.width
+            title: root.displayName
+            // Kept short: the badge eats the right-hand side, and a longer
+            // string elides mid-codec.
+            meta: (root.present ? root.percentage + "%" + (root.charging ? " · charging" : "")
+                : root.charging ? "Charging"
+                : "Battery unknown")
+                + (root.streamText !== "" ? " · " + root.streamText : "")
+            // No "connected" badge: the widget hides itself when the headphones
+            // are away, so it would only ever say one thing. BUSY is worth a
+            // badge because the panel otherwise looks connected but inert.
+            detail: root.stale ? "BUSY" : ""
+            foreground: Color.popups.text
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            iconOpacity: root.stale ? 0.5 : 1
+            iconComponent: Component {
+              Text {
+                textFormat: Text.PlainText
+                text: "󰋋"
+                color: Color.popups.text
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.display
+              }
             }
           }
-        }
 
 
 
-        PanelSeparator {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          foreground: Color.popups.text
-        }
-
-        PanelSectionHeader {
-          text: "NOISE CONTROL"
-          foreground: Color.popups.text
-          visible: root.ancSupported
-        }
-
-        // Three-way mode, matching the app. On the wire this is two things:
-        // ANC on/off (0x1a05) and adaptive-vs-custom (0x1a01 id 3).
-        Row {
-          spacing: Style.spacing.sm
-          visible: root.ancSupported
-
-          Button {
-            text: "Adaptive"
-            bordered: true
-            selected: root.mode === "adaptive"
-            foreground: Color.popups.text
-            onClicked: root.setMode("adaptive")
-          }
-          Button {
-            text: "Custom"
-            bordered: true
-            selected: root.mode === "custom"
-            foreground: Color.popups.text
-            onClicked: root.setMode("custom")
-          }
-          Button {
-            text: "Off"
-            bordered: true
-            selected: root.mode === "off"
-            foreground: Color.popups.text
-            onClicked: root.setMode("off")
-          }
-        }
-
-        // End labels track the mode the way the app does: percentages only
-        // when Custom is actually in charge of the split.
-        Item {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          height: ancLabel.implicitHeight
-          visible: root.ancSupported
-          opacity: root.customMode ? 1.0 : 0.45
-
-          Text {
-
-            textFormat: Text.PlainText
-            id: ancLabel
+          PanelSeparator {
             anchors.left: parent.left
-            color: Qt.darker(Color.popups.text, 1.4)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            text: root.mode === "adaptive" ? "ANC"
-                : root.mode === "off" ? "ANC 0%"
-                : "ANC " + (100 - root.uiLevel) + "%"
-          }
-          Text {
-            textFormat: Text.PlainText
             anchors.right: parent.right
-            color: Qt.darker(Color.popups.text, 1.4)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            text: root.mode === "adaptive" ? "Transparency"
-                : root.mode === "off" ? "0% Transparency"
-                : root.uiLevel + "% Transparency"
-          }
-        }
-
-        PanelSlider {
-          id: slider
-          anchors.left: parent.left
-          anchors.right: parent.right
-          visible: root.ancSupported
-          enabled: root.customMode
-          opacity: root.customMode ? 1.0 : 0.45
-          bar: root.bar
-          minimum: 0
-          maximum: 100
-          step: 5
-          integer: true
-          value: root.uiLevel >= 0 ? root.uiLevel : 0
-          onMoved: function(v) { root.transparency = root.rawFromUi(v) }
-          onReleased: function(v) { root.setUiLevel(v) }
-        }
-
-        Item {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          height: awRow.implicitHeight
-          visible: root.antiwind !== ""
-          opacity: root.customMode ? 1.0 : 0.45
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Anti-wind"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: awRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            // Tri-state, matching the app: the main switch and its Auto/Max
-            // sub-setting are one field on the device.
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.antiwind === "off"
-              foreground: Color.popups.text
-              enabled: root.customMode
-              onClicked: root.setAntiwind("off")
-            }
-            Button {
-              text: "Auto"
-              bordered: true
-              selected: root.antiwind === "auto"
-              foreground: Color.popups.text
-              enabled: root.customMode
-              onClicked: root.setAntiwind("auto")
-            }
-            Button {
-              text: "Max"
-              bordered: true
-              selected: root.antiwind === "max"
-              foreground: Color.popups.text
-              enabled: root.customMode
-              onClicked: root.setAntiwind("max")
-            }
-          }
-        }
-
-        PanelSeparator {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          foreground: Color.popups.text
-          visible: root.bassBoost !== null
-        }
-
-        PanelSectionHeader {
-          text: "SOUND"
-          foreground: Color.popups.text
-          visible: root.bassBoost !== null || root.eq !== null
-        }
-
-        Row {
-          spacing: Style.spacing.sm
-          visible: root.soundMode !== ""
-
-          Button {
-            text: "Graphic EQ"
-            bordered: true
-            selected: root.soundMode === "eq"
             foreground: Color.popups.text
-            tooltipText: "Five-band equaliser with presets"
-            onClicked: root.setSoundMode("eq")
-          }
-          Button {
-            text: "Speech Clarity"
-            bordered: true
-            selected: root.soundMode === "speech"
-            foreground: Color.popups.text
-            tooltipText: "Tunes for voice. Replaces the equaliser and bass boost, which are disabled while it is on."
-            onClicked: root.setSoundMode("speech")
-          }
-        }
-
-        // Separates the mode choice from the controls that mode governs.
-        PanelSeparator {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          foreground: Color.popups.text
-          visible: root.soundMode !== ""
-        }
-
-        PanelSectionHeader {
-          text: "EQUALISER"
-          foreground: Color.popups.text
-          visible: root.eq !== null
-          opacity: root.eqMode ? 1.0 : 0.4
-        }
-
-        // Presets are ours, not the device's, applying one writes all bands.
-        // "Custom" lights when the curve matches no preset, which is what
-        // happens as soon as a band is changed by hand.
-        Flow {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          spacing: Style.spacing.sm
-          visible: root.presets.length > 0 && root.eq !== null
-          enabled: root.eqMode
-          opacity: root.eqMode ? 1.0 : 0.4
-
-          Repeater {
-            model: root.presets
-            Button {
-              text: modelData.name
-              bordered: true
-              selected: root.activePreset() === modelData.name
-              foreground: Color.popups.text
-              onClicked: root.applyPreset(modelData.name)
-            }
           }
 
-          Button {
-            text: "Custom"
-            bordered: true
-            selected: root.activePreset() === ""
-            foreground: Color.popups.text
-            // Reflects state rather than setting it: clicking does nothing,
-            // because "custom" is simply "matches no preset".
-            onClicked: {}
-          }
-        }
-
-        // One PanelSlider per band, rotated upright so it matches the noise
-        // control above rather than being a bespoke widget. Reads over
-        // 0x1003, writes per band over 0x1001.
-        Row {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          visible: root.eq !== null
-          enabled: root.eqMode
-          opacity: root.eqMode ? 1.0 : 0.4
-          spacing: Style.spacing.sm
-
-          Repeater {
-            model: root.eq ? root.eq.length : 0
+          // Noise control and device settings on the left, sound on the right:
+          // the two halves come out about the same height. Flow, so that on a
+          // screen too narrow for both the right column wraps under the left.
+          Flow {
+            id: sectionFlow
+            width: parent.width
+            spacing: root.columnGap
+            readonly property real columnWidth: root.twoColumns
+                ? Math.floor((width - spacing) / 2) : width
 
             Column {
-              id: bandCol
-              width: (parent.width - (parent.spacing * (root.eq.length - 1))) / root.eq.length
-              spacing: 2
+              id: leftColumn
+              width: sectionFlow.columnWidth
+              spacing: Style.spacing.sm
 
-              readonly property real v: root.eq[index]
+              PanelSectionHeader {
+                text: "NOISE CONTROL"
+                foreground: Color.popups.text
+                visible: root.ancSupported
+              }
+
+              // Three-way mode, matching the app. On the wire this is two things:
+              // ANC on/off (0x1a05) and adaptive-vs-custom (0x1a01 id 3).
+              Row {
+                spacing: Style.spacing.sm
+                visible: root.ancSupported
+
+                Button {
+                  text: "Adaptive"
+                  bordered: true
+                  selected: root.mode === "adaptive"
+                  foreground: Color.popups.text
+                  onClicked: root.setMode("adaptive")
+                }
+                Button {
+                  text: "Custom"
+                  bordered: true
+                  selected: root.mode === "custom"
+                  foreground: Color.popups.text
+                  onClicked: root.setMode("custom")
+                }
+                Button {
+                  text: "Off"
+                  bordered: true
+                  selected: root.mode === "off"
+                  foreground: Color.popups.text
+                  onClicked: root.setMode("off")
+                }
+              }
+
+              // End labels track the mode the way the app does: percentages only
+              // when Custom is actually in charge of the split.
+              Item {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: ancLabel.implicitHeight
+                visible: root.ancSupported
+                opacity: root.customMode ? 1.0 : 0.45
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  id: ancLabel
+                  anchors.left: parent.left
+                  color: Qt.darker(Color.popups.text, 1.4)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  text: root.mode === "adaptive" ? "ANC"
+                      : root.mode === "off" ? "ANC 0%"
+                      : "ANC " + (100 - root.uiLevel) + "%"
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  anchors.right: parent.right
+                  color: Qt.darker(Color.popups.text, 1.4)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  text: root.mode === "adaptive" ? "Transparency"
+                      : root.mode === "off" ? "0% Transparency"
+                      : root.uiLevel + "% Transparency"
+                }
+              }
+
+              PanelSlider {
+                id: slider
+                anchors.left: parent.left
+                anchors.right: parent.right
+                visible: root.ancSupported
+                enabled: root.customMode
+                opacity: root.customMode ? 1.0 : 0.45
+                bar: root.bar
+                minimum: 0
+                maximum: 100
+                step: 5
+                integer: true
+                value: root.uiLevel >= 0 ? root.uiLevel : 0
+                onMoved: function(v) { root.transparency = root.rawFromUi(v) }
+                onReleased: function(v) { root.setUiLevel(v) }
+              }
 
               Item {
-                width: parent.width
-                height: Style.space(74)
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: awRow.implicitHeight
+                visible: root.antiwind !== ""
+                opacity: root.customMode ? 1.0 : 0.45
 
-                PanelSlider {
-                  // Rotated, so its width becomes the visible height.
-                  width: parent.height
-                  rotation: -90
-                  anchors.centerIn: parent
-                  bar: root.bar
-                  minimum: -root.eqRange
-                  maximum: root.eqRange
-                  step: 0.5
-                  value: bandCol.v
-                  onMoved: function(nv) { root.setEqLocal(index, nv) }
-                  onReleased: function(nv) {
-                    root.setEqLocal(index, nv)
-                    root.commitEqBand(index)
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Anti-wind"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: awRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  // Tri-state, matching the app: the main switch and its Auto/Max
+                  // sub-setting are one field on the device.
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.antiwind === "off"
+                    foreground: Color.popups.text
+                    enabled: root.customMode
+                    onClicked: root.setAntiwind("off")
+                  }
+                  Button {
+                    text: "Auto"
+                    bordered: true
+                    selected: root.antiwind === "auto"
+                    foreground: Color.popups.text
+                    enabled: root.customMode
+                    onClicked: root.setAntiwind("auto")
+                  }
+                  Button {
+                    text: "Max"
+                    bordered: true
+                    selected: root.antiwind === "max"
+                    foreground: Color.popups.text
+                    enabled: root.customMode
+                    onClicked: root.setAntiwind("max")
+                  }
+                }
+              }
+
+              PanelSeparator {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                foreground: Color.popups.text
+                visible: root.onHead !== null || root.smartPause !== null || root.autoAnswer !== null || root.comfortCall !== null || root.controls !== null
+              }
+
+              // Smart Control's Device Settings pane, in its order. Descriptions are
+              // the app's own, as tooltips.
+              PanelSectionHeader {
+                text: "DEVICE SETTINGS"
+                foreground: Color.popups.text
+                visible: root.onHead !== null || root.smartPause !== null || root.autoAnswer !== null || root.comfortCall !== null || root.controls !== null
+              }
+              Item {
+                width: parent.width
+                height: onHeadRow.height
+                visible: root.onHead !== null
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "On-head Detection"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: onHeadRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.onHead === false
+                    foreground: Color.popups.text
+                    tooltipText: "Enable smart pause, hold calls automatically, power saving mode"
+                    onClicked: root.setFeature("on-head", root.onHead, false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.onHead === true
+                    foreground: Color.popups.text
+                    tooltipText: "Enable smart pause, hold calls automatically, power saving mode"
+                    onClicked: root.setFeature("on-head", root.onHead, true)
+                  }
+                }
+              }
+              Item {
+                width: parent.width
+                height: smartPauseRow.height
+                visible: root.smartPause !== null
+                // On-head Detection drives this (the app's own description lists
+                // it), so it reads as unavailable while the sensor is off.
+                enabled: root.onHead !== false
+                opacity: root.onHead !== false ? 1.0 : 0.4
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Smart Pause"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: smartPauseRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.smartPause === false
+                    foreground: Color.popups.text
+                    tooltipText: "Pause music by taking headphones off. Continue when putting back on."
+                    onClicked: root.setFeature("smart-pause", root.smartPause, false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.smartPause === true
+                    foreground: Color.popups.text
+                    tooltipText: "Pause music by taking headphones off. Continue when putting back on."
+                    onClicked: root.setFeature("smart-pause", root.smartPause, true)
+                  }
+                }
+              }
+              Item {
+                width: parent.width
+                height: autoAnswerRow.height
+                visible: root.autoAnswer !== null
+                // On-head Detection drives this (the app's own description lists
+                // it), so it reads as unavailable while the sensor is off.
+                enabled: root.onHead !== false
+                opacity: root.onHead !== false ? 1.0 : 0.4
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Auto-Answer Calls"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: autoAnswerRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.autoAnswer === false
+                    foreground: Color.popups.text
+                    tooltipText: "Answers calls when you put headphones on."
+                    onClicked: root.setFeature("auto-answer", root.autoAnswer, false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.autoAnswer === true
+                    foreground: Color.popups.text
+                    tooltipText: "Answers calls when you put headphones on."
+                    onClicked: root.setFeature("auto-answer", root.autoAnswer, true)
+                  }
+                }
+              }
+
+              // Smart Control's Auto Power Off: Never / 15 / 30 / 60 min. Label and
+              // buttons on separate lines, four buttons do not fit beside a label.
+              Column {
+                width: parent.width
+                spacing: Style.spacing.xs
+                visible: root.autoOff !== null
+                // On-head Detection drives this (the app's own description lists
+                // it), so it reads as unavailable while the sensor is off.
+                enabled: root.onHead !== false
+                opacity: root.onHead !== false ? 1.0 : 0.4
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  text: "Auto Power Off (minutes)"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Item {
+                  width: parent.width
+                  height: autoOffRow.height
+
+                Row {
+                  id: autoOffRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Repeater {
+                    model: [
+                      { label: "Never", choice: "never", secs: 0 },
+                      { label: "15",    choice: "15",    secs: 900 },
+                      { label: "30",    choice: "30",    secs: 1800 },
+                      { label: "60",    choice: "60",    secs: 3600 }
+                    ]
+                    Button {
+                      required property var modelData
+                      text: modelData.label
+                      bordered: true
+                      selected: root.autoOff === modelData.secs
+                      foreground: Color.popups.text
+                      tooltipText: "Sets the time after which your device turns itself off to save power"
+                      onClicked: root.setAutoOff(modelData.choice)
+                    }
+                  }
+                }
+                }
+              }
+              Item {
+                width: parent.width
+                height: comfortCallRow.height
+                visible: root.comfortCall !== null
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Comfort Calls"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: comfortCallRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.comfortCall === false
+                    foreground: Color.popups.text
+                    tooltipText: "Gives phone calls a more natural sound stage"
+                    onClicked: root.setFeature("comfort-call", root.comfortCall, false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.comfortCall === true
+                    foreground: Color.popups.text
+                    tooltipText: "Gives phone calls a more natural sound stage"
+                    onClicked: root.setFeature("comfort-call", root.comfortCall, true)
+                  }
+                }
+              }
+
+              // The on-cup touch/button controls. The device stores this inverted
+              // (0 = enabled), which m4ctl normalises, so this stays a plain
+              // enabled/disabled pair.
+              Item {
+                width: parent.width
+                height: controlsRow.height
+                visible: root.controls !== null
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Touch controls"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: controlsRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.controls === false
+                    foreground: Color.popups.text
+                    tooltipText: "Enable or disable the touch controls on the ear cup"
+                    onClicked: root.setControls(false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.controls === true
+                    foreground: Color.popups.text
+                    tooltipText: "Enable or disable the touch controls on the ear cup"
+                    onClicked: root.setControls(true)
                   }
                 }
               }
@@ -731,346 +1020,215 @@ Panel {
               Text {
 
                 textFormat: Text.PlainText
-                width: parent.width
-                horizontalAlignment: Text.AlignHCenter
-                text: (bandCol.v > 0 ? "+" : "") + bandCol.v.toFixed(1)
-                color: Color.popups.text
+                text: "Noise control unavailable for this device"
+                visible: !root.ancSupported
+                color: Qt.darker(Color.popups.text, 1.4)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
-              }
-
-              // The app's nominal labels; the device's real centres are
-              // 90/325/1500/6500/6500 Hz.
-              Text {
-                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
                 width: parent.width
-                horizontalAlignment: Text.AlignHCenter
-                text: ["63Hz", "250Hz", "1kHz", "4kHz", "8kHz"][index]
-                color: Qt.darker(Color.popups.text, 1.5)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
               }
             }
-          }
-        }
 
-        // Labelled row, matching how Anti-wind sits under Noise control.
-        Item {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          height: bassRow.implicitHeight
-          visible: root.bassBoost !== null
-          enabled: root.eqMode
-          opacity: root.eqMode ? 1.0 : 0.4
+            Column {
+              id: rightColumn
+              width: sectionFlow.columnWidth
+              spacing: Style.spacing.sm
 
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Bass boost"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: bassRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.bassBoost === false
-              foreground: Color.popups.text
-              onClicked: root.setBass(false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.bassBoost === true
-              foreground: Color.popups.text
-              onClicked: root.setBass(true)
-            }
-          }
-        }
-
-        PanelSeparator {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          foreground: Color.popups.text
-          visible: root.onHead !== null || root.smartPause !== null || root.autoAnswer !== null || root.comfortCall !== null || root.controls !== null
-        }
-
-        // Smart Control's Device Settings pane, in its order. Descriptions are
-        // the app's own, as tooltips.
-        PanelSectionHeader {
-          text: "DEVICE SETTINGS"
-          foreground: Color.popups.text
-          visible: root.onHead !== null || root.smartPause !== null || root.autoAnswer !== null || root.comfortCall !== null || root.controls !== null
-        }
-        Item {
-          width: parent.width
-          height: onHeadRow.height
-          visible: root.onHead !== null
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "On-head Detection"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: onHeadRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.onHead === false
-              foreground: Color.popups.text
-              tooltipText: "Enable smart pause, hold calls automatically, power saving mode"
-              onClicked: root.setFeature("on-head", root.onHead, false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.onHead === true
-              foreground: Color.popups.text
-              tooltipText: "Enable smart pause, hold calls automatically, power saving mode"
-              onClicked: root.setFeature("on-head", root.onHead, true)
-            }
-          }
-        }
-        Item {
-          width: parent.width
-          height: smartPauseRow.height
-          visible: root.smartPause !== null
-          // On-head Detection drives this (the app's own description lists
-          // it), so it reads as unavailable while the sensor is off.
-          enabled: root.onHead !== false
-          opacity: root.onHead !== false ? 1.0 : 0.4
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Smart Pause"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: smartPauseRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.smartPause === false
-              foreground: Color.popups.text
-              tooltipText: "Pause music by taking headphones off. Continue when putting back on."
-              onClicked: root.setFeature("smart-pause", root.smartPause, false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.smartPause === true
-              foreground: Color.popups.text
-              tooltipText: "Pause music by taking headphones off. Continue when putting back on."
-              onClicked: root.setFeature("smart-pause", root.smartPause, true)
-            }
-          }
-        }
-        Item {
-          width: parent.width
-          height: autoAnswerRow.height
-          visible: root.autoAnswer !== null
-          // On-head Detection drives this (the app's own description lists
-          // it), so it reads as unavailable while the sensor is off.
-          enabled: root.onHead !== false
-          opacity: root.onHead !== false ? 1.0 : 0.4
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Auto-Answer Calls"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: autoAnswerRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.autoAnswer === false
-              foreground: Color.popups.text
-              tooltipText: "Answers calls when you put headphones on."
-              onClicked: root.setFeature("auto-answer", root.autoAnswer, false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.autoAnswer === true
-              foreground: Color.popups.text
-              tooltipText: "Answers calls when you put headphones on."
-              onClicked: root.setFeature("auto-answer", root.autoAnswer, true)
-            }
-          }
-        }
-
-        // Smart Control's Auto Power Off: Never / 15 / 30 / 60 min. Label and
-        // buttons on separate lines, four buttons do not fit beside a label.
-        Column {
-          width: parent.width
-          spacing: Style.spacing.xs
-          visible: root.autoOff !== null
-          // On-head Detection drives this (the app's own description lists
-          // it), so it reads as unavailable while the sensor is off.
-          enabled: root.onHead !== false
-          opacity: root.onHead !== false ? 1.0 : 0.4
-
-          Text {
-
-            textFormat: Text.PlainText
-            text: "Auto Power Off (minutes)"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Item {
-            width: parent.width
-            height: autoOffRow.height
-
-          Row {
-            id: autoOffRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Repeater {
-              model: [
-                { label: "Never", choice: "never", secs: 0 },
-                { label: "15",    choice: "15",    secs: 900 },
-                { label: "30",    choice: "30",    secs: 1800 },
-                { label: "60",    choice: "60",    secs: 3600 }
-              ]
-              Button {
-                required property var modelData
-                text: modelData.label
-                bordered: true
-                selected: root.autoOff === modelData.secs
+              PanelSeparator {
+                anchors.left: parent.left
+                anchors.right: parent.right
                 foreground: Color.popups.text
-                tooltipText: "Sets the time after which your device turns itself off to save power"
-                onClicked: root.setAutoOff(modelData.choice)
+                visible: !root.twoColumns && root.bassBoost !== null
+              }
+
+              PanelSectionHeader {
+                text: "SOUND"
+                foreground: Color.popups.text
+                visible: root.bassBoost !== null || root.eq !== null
+              }
+
+              Row {
+                spacing: Style.spacing.sm
+                visible: root.soundMode !== ""
+
+                Button {
+                  text: "Graphic EQ"
+                  bordered: true
+                  selected: root.soundMode === "eq"
+                  foreground: Color.popups.text
+                  tooltipText: "Five-band equaliser with presets"
+                  onClicked: root.setSoundMode("eq")
+                }
+                Button {
+                  text: "Speech Clarity"
+                  bordered: true
+                  selected: root.soundMode === "speech"
+                  foreground: Color.popups.text
+                  tooltipText: "Tunes for voice. Replaces the equaliser and bass boost, which are disabled while it is on."
+                  onClicked: root.setSoundMode("speech")
+                }
+              }
+
+              // Separates the mode choice from the controls that mode governs.
+              PanelSeparator {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                foreground: Color.popups.text
+                visible: root.soundMode !== ""
+              }
+
+              PanelSectionHeader {
+                text: "EQUALISER"
+                foreground: Color.popups.text
+                visible: root.eq !== null
+                opacity: root.eqMode ? 1.0 : 0.4
+              }
+
+              // Presets are ours, not the device's, applying one writes all bands.
+              // "Custom" lights when the curve matches no preset, which is what
+              // happens as soon as a band is changed by hand.
+              Flow {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: Style.spacing.sm
+                visible: root.presets.length > 0 && root.eq !== null
+                enabled: root.eqMode
+                opacity: root.eqMode ? 1.0 : 0.4
+
+                Repeater {
+                  model: root.presets
+                  Button {
+                    text: modelData.name
+                    bordered: true
+                    selected: root.activePreset() === modelData.name
+                    foreground: Color.popups.text
+                    onClicked: root.applyPreset(modelData.name)
+                  }
+                }
+
+                Button {
+                  text: "Custom"
+                  bordered: true
+                  selected: root.activePreset() === ""
+                  foreground: Color.popups.text
+                  // Reflects state rather than setting it: clicking does nothing,
+                  // because "custom" is simply "matches no preset".
+                  onClicked: {}
+                }
+              }
+
+              // One PanelSlider per band, rotated upright so it matches the noise
+              // control above rather than being a bespoke widget. Reads over
+              // 0x1003, writes per band over 0x1001.
+              Row {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                visible: root.eq !== null
+                enabled: root.eqMode
+                opacity: root.eqMode ? 1.0 : 0.4
+                spacing: Style.spacing.sm
+
+                Repeater {
+                  model: root.eq ? root.eq.length : 0
+
+                  Column {
+                    id: bandCol
+                    width: (parent.width - (parent.spacing * (root.eq.length - 1))) / root.eq.length
+                    spacing: 2
+
+                    readonly property real v: root.eq[index]
+
+                    Item {
+                      width: parent.width
+                      height: Style.space(74)
+
+                      PanelSlider {
+                        // Rotated, so its width becomes the visible height.
+                        width: parent.height
+                        rotation: -90
+                        anchors.centerIn: parent
+                        bar: root.bar
+                        minimum: -root.eqRange
+                        maximum: root.eqRange
+                        step: 0.5
+                        value: bandCol.v
+                        onMoved: function(nv) { root.setEqLocal(index, nv) }
+                        onReleased: function(nv) {
+                          root.setEqLocal(index, nv)
+                          root.commitEqBand(index)
+                        }
+                      }
+                    }
+
+                    Text {
+
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      horizontalAlignment: Text.AlignHCenter
+                      text: (bandCol.v > 0 ? "+" : "") + bandCol.v.toFixed(1)
+                      color: Color.popups.text
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    // The app's nominal labels; the device's real centres are
+                    // 90/325/1500/6500/6500 Hz.
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      horizontalAlignment: Text.AlignHCenter
+                      text: ["63Hz", "250Hz", "1kHz", "4kHz", "8kHz"][index]
+                      color: Qt.darker(Color.popups.text, 1.5)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+
+              // Labelled row, matching how Anti-wind sits under Noise control.
+              Item {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: bassRow.implicitHeight
+                visible: root.bassBoost !== null
+                enabled: root.eqMode
+                opacity: root.eqMode ? 1.0 : 0.4
+
+                Text {
+
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Bass boost"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Row {
+                  id: bassRow
+                  anchors.right: parent.right
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "Off"
+                    bordered: true
+                    selected: root.bassBoost === false
+                    foreground: Color.popups.text
+                    onClicked: root.setBass(false)
+                  }
+                  Button {
+                    text: "On"
+                    bordered: true
+                    selected: root.bassBoost === true
+                    foreground: Color.popups.text
+                    onClicked: root.setBass(true)
+                  }
+                }
               }
             }
           }
-          }
-        }
-        Item {
-          width: parent.width
-          height: comfortCallRow.height
-          visible: root.comfortCall !== null
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Comfort Calls"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: comfortCallRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.comfortCall === false
-              foreground: Color.popups.text
-              tooltipText: "Gives phone calls a more natural sound stage"
-              onClicked: root.setFeature("comfort-call", root.comfortCall, false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.comfortCall === true
-              foreground: Color.popups.text
-              tooltipText: "Gives phone calls a more natural sound stage"
-              onClicked: root.setFeature("comfort-call", root.comfortCall, true)
-            }
-          }
-        }
-
-        // The on-cup touch/button controls. The device stores this inverted
-        // (0 = enabled), which m4ctl normalises, so this stays a plain
-        // enabled/disabled pair.
-        Item {
-          width: parent.width
-          height: controlsRow.height
-          visible: root.controls !== null
-
-          Text {
-
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Touch controls"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          Row {
-            id: controlsRow
-            anchors.right: parent.right
-            spacing: Style.spacing.sm
-
-            Button {
-              text: "Off"
-              bordered: true
-              selected: root.controls === false
-              foreground: Color.popups.text
-              tooltipText: "Enable or disable the touch controls on the ear cup"
-              onClicked: root.setControls(false)
-            }
-            Button {
-              text: "On"
-              bordered: true
-              selected: root.controls === true
-              foreground: Color.popups.text
-              tooltipText: "Enable or disable the touch controls on the ear cup"
-              onClicked: root.setControls(true)
-            }
-          }
-        }
-
-        Text {
-
-          textFormat: Text.PlainText
-          text: "Noise control unavailable for this device"
-          visible: !root.ancSupported
-          color: Qt.darker(Color.popups.text, 1.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-          width: parent.width
         }
       }
     }

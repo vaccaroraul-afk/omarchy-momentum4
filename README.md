@@ -12,12 +12,24 @@ Built for one set of headphones. It speaks the Momentum 4's own protocol
 and will not work with anything else. Plain standard-library Python, no
 packages, no binaries, no root.
 
+> **Fork of [DanSmith888/omarchy-momentum4](https://github.com/DanSmith888/omarchy-momentum4).**
+> Same plugin id, so it replaces upstream rather than installing beside it.
+>
+> **This copy is event-driven.** Upstream polled: a Python helper every 5 s
+> while the headphones were away, and two Python helpers plus a full GAIA
+> read every 60 s while they were connected. Here presence and the bar's
+> battery come from BlueZ through Quickshell's Bluetooth module, so with the
+> panel closed nothing runs at all. GAIA is read once when the headphones
+> connect, every 5 s while the panel is open, after each change made from the
+> panel, and on middle-click. Presets are read from `presets.json` directly
+> instead of through a Python process at shell start.
+
 ## Install
 
 Pair the headphones over Bluetooth, then:
 
 ```bash
-omarchy plugin add https://github.com/DanSmith888/omarchy-momentum4.git --enable
+omarchy plugin add https://github.com/vaccaroraul-afk/omarchy-momentum4.git --enable
 ```
 
 ### Check it
@@ -123,8 +135,11 @@ tagged `[syntax]` is real.
 ## Good to know
 
 - **Charging is not shown.** The headphones announce cable in and out but
-  cannot be asked, and this widget polls. Battery keeps reading normally
-  while charging.
+  cannot be asked, and this widget does not hold a GAIA connection open to
+  hear it. Battery keeps reading normally while charging.
+- **The bar's battery comes from BlueZ**, which learns it over the
+  hands-free link and may round it. The panel's GAIA read is exact, and
+  whichever of the two arrived last is what the bar shows.
 - **"USB-C connected" means plugged into this PC**, detected when the
   headphones enumerate as a USB audio card (`/proc/asound/cards`). A wall
   charger or another machine shows nothing.
@@ -139,8 +154,11 @@ tagged `[syntax]` is real.
 
 Plugins run unsandboxed inside the Omarchy shell as your user.
 
-- `bin/m4status` and `bin/m4ctl` ask `bluetoothctl` which device is
-  connected and talk to the headphones over an RFCOMM socket. Nothing else.
+- The widget learns that the headphones connected, and their battery, from
+  the shell's existing BlueZ D-Bus connection (`Quickshell.Bluetooth`).
+- `bin/m4status` and `bin/m4ctl` talk to the headphones over an RFCOMM
+  socket, and only when a read is due (see above). The widget passes them
+  the address; run from a terminal, they ask `bluetoothctl` for it.
 - No root, no network, no background services, no writes outside
   `$XDG_RUNTIME_DIR` (a lock file).
 - The reverse-engineering kit and device captures are not shipped. They

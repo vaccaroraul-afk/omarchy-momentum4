@@ -402,8 +402,8 @@ def doctor():
     if failed:
         print(f"  {failed} check(s) failed.")
     else:
-        print("  All checks passed. If the widget is still missing, give it "
-              "5s to poll, then: omarchy restart shell")
+        print("  All checks passed. If the widget is still missing, "
+              "try: omarchy restart shell")
     return 1 if failed else 0
 
 
@@ -461,7 +461,7 @@ COMMON_CHANNELS = [2, 1, 15, 14, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 # m4status and gaia-probe at once.
 # Identity the doctor checks the install against. Must match manifest.json.
 PLUGIN_ID = "dansmith888.momentum4"
-REPO_URL = "https://github.com/DanSmith888/omarchy-momentum4.git"
+REPO_URL = "https://github.com/vaccaroraul-afk/omarchy-momentum4.git"
 
 # The lock lives in the owner-only runtime dir, never a shared /tmp: a
 # predictable path there could be pre-created by another user.
